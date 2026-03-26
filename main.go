@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,7 +22,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/tinfoilsh/confidential-model-router/builtins/codeinterpreter"
+	"github.com/tinfoilsh/confidential-model-router/builtins/websearch"
 	"github.com/tinfoilsh/confidential-model-router/manager"
+	"github.com/tinfoilsh/confidential-model-router/openaiapi"
 )
 
 //go:embed config.yml
@@ -59,13 +61,18 @@ func getEnvBool(envKey string) bool {
 }
 
 var (
-	port            = flag.String("l", getEnvOrDefault("PORT", "8089"), "port to listen on (env: PORT)")
-	controlPlaneURL = flag.String("C", getEnvOrDefault("CONTROL_PLANE_URL", "https://api.tinfoil.sh"), "control plane URL (env: CONTROL_PLANE_URL)")
-	verbose         = flag.Bool("v", getEnvBool("VERBOSE"), "enable verbose logging (env: VERBOSE)")
-	initConfigURL   = flag.String("i", getEnvOrDefault("INIT_CONFIG_URL", ""), "optional path to initial config.yml (requires to append @sha256:<hex> for integrity) (env: INIT_CONFIG_URL)")
-	updateConfigURL = flag.String("u", getEnvOrDefault("UPDATE_CONFIG_URL", "https://raw.githubusercontent.com/tinfoilsh/confidential-model-router/main/config.yml"), "path to runtime config.yml (env: UPDATE_CONFIG_URL)")
-	domain          = flag.String("d", getEnvOrDefault("DOMAIN", "localhost"), "domain used by this router (env: DOMAIN)")
-	refreshInterval = flag.Duration("r", getEnvOrDefaultDuration("REFRESH_INTERVAL", 5*time.Minute), "refresh interval for syncing enclave config (env: REFRESH_INTERVAL)")
+	port                       = flag.String("l", getEnvOrDefault("PORT", "8089"), "port to listen on (env: PORT)")
+	controlPlaneURL            = flag.String("C", getEnvOrDefault("CONTROL_PLANE_URL", "https://api.tinfoil.sh"), "control plane URL (env: CONTROL_PLANE_URL)")
+	verbose                    = flag.Bool("v", getEnvBool("VERBOSE"), "enable verbose logging (env: VERBOSE)")
+	initConfigURL              = flag.String("i", getEnvOrDefault("INIT_CONFIG_URL", ""), "optional path to initial config.yml (requires to append @sha256:<hex> for integrity) (env: INIT_CONFIG_URL)")
+	updateConfigURL            = flag.String("u", getEnvOrDefault("UPDATE_CONFIG_URL", "https://raw.githubusercontent.com/tinfoilsh/confidential-model-router/main/config.yml"), "path to runtime config.yml (env: UPDATE_CONFIG_URL)")
+	domain                     = flag.String("d", getEnvOrDefault("DOMAIN", "localhost"), "domain used by this router (env: DOMAIN)")
+	refreshInterval            = flag.Duration("r", getEnvOrDefaultDuration("REFRESH_INTERVAL", 5*time.Minute), "refresh interval for syncing enclave config (env: REFRESH_INTERVAL)")
+	codeInterpreterBaseURL     = flag.String("I", getEnvOrDefault("CODE_INTERPRETER_BASE_URL", ""), "code interpreter backend base URL (env: CODE_INTERPRETER_BASE_URL)")
+	codeInterpreterImage       = flag.String("J", getEnvOrDefault("CODE_INTERPRETER_IMAGE", ""), "managed sandbox image for code interpreter (env: CODE_INTERPRETER_IMAGE)")
+	codeInterpreterRepo        = flag.String("R", getEnvOrDefault("CODE_INTERPRETER_REPO", ""), "GitHub repo for code interpreter attestation, e.g. org/repo (env: CODE_INTERPRETER_REPO)")
+	controlPlaneSandboxAPIKey  = flag.String("K", getEnvOrDefault("CONTROL_PLANE_SANDBOX_API_KEY", ""), "router-to-controlplane sandbox orchestration bearer token (env: CONTROL_PLANE_SANDBOX_API_KEY)")
+	codeInterpreterExecTimeout = flag.Duration("t", getEnvOrDefaultDuration("CODE_INTERPRETER_EXEC_TIMEOUT", 60*time.Second), "code interpreter execution timeout (env: CODE_INTERPRETER_EXEC_TIMEOUT)")
 )
 
 func jsonError(w http.ResponseWriter, message string, errType string, code int) {
@@ -107,6 +114,31 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return false
 }
 
+func applyRealtimeWebSocketAuth(r *http.Request, apiKey string) string {
+	if apiKey != "" {
+		return apiKey
+	}
+
+	const subprotoPrefix = "openai-insecure-api-key."
+	var cleaned []string
+	for _, proto := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
+		proto = strings.TrimSpace(proto)
+		if strings.HasPrefix(proto, subprotoPrefix) {
+			apiKey = strings.TrimPrefix(proto, subprotoPrefix)
+		} else if proto != "" {
+			cleaned = append(cleaned, proto)
+		}
+	}
+	if apiKey != "" {
+		r.Header.Set("Authorization", "Bearer "+apiKey)
+		if len(cleaned) > 0 {
+			r.Header.Set("Sec-WebSocket-Protocol", strings.Join(cleaned, ", "))
+		} else {
+			r.Header.Del("Sec-WebSocket-Protocol")
+		}
+	}
+	return apiKey
+}
 func parseModelFromSubdomain(r *http.Request, domain string) (string, error) {
 	// Check if the request is for a subdomain and derive model from leftmost subdomain.
 	host := r.Header.Get("X-Forwarded-Host")
@@ -191,6 +223,19 @@ func main() {
 	defer em.Shutdown()
 	go em.StartWorker()
 
+	codeInterpreterTool, err := codeinterpreter.New(codeinterpreter.Config{
+		ControlPlaneURL:    *controlPlaneURL,
+		ControlPlaneAPIKey: *controlPlaneSandboxAPIKey,
+		BaseURL:            *codeInterpreterBaseURL,
+		Image:              *codeInterpreterImage,
+		Repo:               *codeInterpreterRepo,
+		ExecTimeout:        *codeInterpreterExecTimeout,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	openaiRunner := openaiapi.NewRunner(websearch.New(), codeInterpreterTool)
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		var modelName string
 		var err error
@@ -206,8 +251,8 @@ func main() {
 			return
 		}
 
-		// WebSocket upgrade on /v1/realtime: extract model from ?model= query parameter, skip body parsing
-		if isWebSocketUpgrade(r) && r.URL.Path == "/v1/realtime" {
+			// WebSocket upgrade on /v1/realtime: extract model from ?model= query parameter, skip body parsing.
+			if isWebSocketUpgrade(r) && r.URL.Path == "/v1/realtime" {
 			if modelName == "" {
 				modelName = r.URL.Query().Get("model")
 			}
@@ -216,31 +261,9 @@ func main() {
 				return
 			}
 
-			// Browser WebSocket auth: extract API key from Sec-WebSocket-Protocol subprotocol
-			// Browsers can't set Authorization headers, so they pass the key as:
-			//   new WebSocket(url, ["realtime", "openai-insecure-api-key.<key>"])
-			if apiKey == "" {
-				const subprotoPrefix = "openai-insecure-api-key."
-				var cleaned []string
-				for _, proto := range strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",") {
-					proto = strings.TrimSpace(proto)
-					if strings.HasPrefix(proto, subprotoPrefix) {
-						apiKey = strings.TrimPrefix(proto, subprotoPrefix)
-					} else if proto != "" {
-						cleaned = append(cleaned, proto)
-					}
-				}
-				if apiKey != "" {
-					r.Header.Set("Authorization", "Bearer "+apiKey)
-					if len(cleaned) > 0 {
-						r.Header.Set("Sec-WebSocket-Protocol", strings.Join(cleaned, ", "))
-					} else {
-						r.Header.Del("Sec-WebSocket-Protocol")
-					}
-				}
-			}
+				apiKey = applyRealtimeWebSocketAuth(r, apiKey)
 
-			log.WithFields(log.Fields{
+				log.WithFields(log.Fields{
 				"model": modelName,
 				"path":  r.URL.Path,
 			}).Debug("WebSocket upgrade request")
@@ -314,121 +337,20 @@ func main() {
 			} else if r.URL.Path == "/v1/convert/file" {
 				modelName = "doc-upload"
 			} else { // This is an OpenAI-compatible API request
-				var body map[string]interface{}
 				bodyBytes, err := io.ReadAll(r.Body)
-
 				if err != nil {
 					jsonError(w, fmt.Sprintf("Could not read request body: %v.", err), manager.ErrTypeInvalidRequest, http.StatusBadRequest)
 					return
 				}
-				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+				r.Body.Close()
+
+				plan, err := openaiRunner.PlanRequest(r, bodyBytes)
+				if err != nil {
 					jsonError(w, fmt.Sprintf("Invalid request body: %v.", err), manager.ErrTypeInvalidRequest, http.StatusBadRequest)
 					return
 				}
-
-				// Extract model name from request body
-				modelInterface, ok := body["model"]
-				if !ok {
-					jsonError(w, "Missing required parameter: 'model'.", manager.ErrTypeInvalidRequest, http.StatusBadRequest)
-					return
-				}
-				modelName, ok = modelInterface.(string)
-				if !ok {
-					jsonError(w, "Invalid parameter: 'model' must be a string.", manager.ErrTypeInvalidRequest, http.StatusBadRequest)
-					return
-				}
-
-				// Check if request uses web search — route to websearch enclave.
-				// The original model name is preserved in the request body so the
-				// websearch service knows which model to use for inference.
-				useWebsearch := false
-				if _, ok := body["web_search_options"]; ok {
-					useWebsearch = true
-				} else if r.URL.Path == "/v1/responses" {
-					if tools, ok := body["tools"].([]interface{}); ok {
-						useWebsearch = slices.ContainsFunc(tools, func(t any) bool {
-							m, _ := t.(map[string]any)
-							typeVal, ok := m["type"].(string)
-							return ok && typeVal == "web_search"
-						})
-					}
-				}
-				rateLimitModel := modelName
-				if useWebsearch {
-					modelName = "websearch"
-				}
-
-				// Strip any user-supplied priority to prevent circumventing rate limits
-				// or jumping ahead of other users.
-				_, hadPriority := body["priority"]
-				delete(body, "priority")
-
-				// Check rate limiting and inject lower vLLM priority if over budget
-				bodyModified := hadPriority
-				if rlCfg := em.GetRateLimitConfig(rateLimitModel); rlCfg != nil {
-					if apiKey != "" && em.RequestTracker().RecordAndCheck(apiKey, rateLimitModel, rlCfg.MaxRequestsPerMinute) {
-						body["priority"] = 1
-						bodyModified = true
-						manager.RateLimitDemotionsTotal.WithLabelValues(rateLimitModel).Inc()
-						log.WithFields(log.Fields{
-							"model": rateLimitModel,
-						}).Debug("rate limited: injecting lower vLLM priority")
-					}
-				}
-
-				// If streaming request, ensure continuous_usage_stats is enabled
-				if stream, ok := body["stream"].(bool); ok && stream {
-					// Check if client requested usage stats before we modify anything
-					clientRequestedUsage := false
-					if streamOptions, ok := body["stream_options"].(map[string]interface{}); ok {
-						// Check for OpenAI-style include_usage
-						if includeUsage, ok := streamOptions["include_usage"].(bool); ok && includeUsage {
-							clientRequestedUsage = true
-						}
-						// Check for vLLM-style continuous_usage_stats
-						if continuousUsage, ok := streamOptions["continuous_usage_stats"].(bool); ok && continuousUsage {
-							clientRequestedUsage = true
-						}
-						streamOptions["continuous_usage_stats"] = true
-					} else {
-						body["stream_options"] = map[string]interface{}{
-							"continuous_usage_stats": true,
-						}
-					}
-
-					// Set internal header to indicate if client requested usage
-					// This header will be used by the proxy to decide whether to filter usage-only chunks
-					if clientRequestedUsage {
-						r.Header.Set("X-Tinfoil-Client-Requested-Usage", "true")
-					}
-
-					// Re-encode the modified body
-					newBodyBytes, err := json.Marshal(body)
-					if err != nil {
-						jsonError(w, manager.ErrMsgServerError, manager.ErrTypeServer, http.StatusInternalServerError)
-						return
-					}
-					bodyBytes = newBodyBytes
-					// Update Content-Length header to match new body size
-					r.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyBytes)))
-					r.ContentLength = int64(len(bodyBytes))
-					log.Debugf("Modified streaming request body to include continuous_usage_stats, client requested usage: %v", clientRequestedUsage)
-				}
-
-				// Re-encode body if rate limiting modified it (non-streaming path)
-				if bodyModified {
-					newBodyBytes, err := json.Marshal(body)
-					if err != nil {
-						jsonError(w, manager.ErrMsgServerError, manager.ErrTypeServer, http.StatusInternalServerError)
-						return
-					}
-					bodyBytes = newBodyBytes
-					r.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyBytes)))
-					r.ContentLength = int64(len(bodyBytes))
-				}
-
-				r.Body.Close()
-				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				plan.Serve(r.Context(), w, r, em, apiKey)
+				return
 			}
 		}
 
